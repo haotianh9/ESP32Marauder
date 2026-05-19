@@ -5,6 +5,7 @@
 
 #include "configs.h"
 #include "utils.h"
+#include "MarauderCsi.h"
 
 #include <ArduinoJson.h>
 #include <algorithm>
@@ -157,6 +158,8 @@
 #define BT_SCAN_RAYBAN 81
 #define BT_ATTACK_APPLE_JUICE 82
 #define WIFI_SCAN_DISPLAY_AP_INFO 83
+#define WIFI_SCAN_CSI_PASSIVE 84
+#define WIFI_SCAN_CSI_ROUTER 85
 
 #define WIFI_ATTACK_FUNNY_BEACON 99 
 
@@ -327,7 +330,14 @@ class WiFiScan
     uint32_t initTime = 0;
     uint32_t last_ui_update = 0;
     uint32_t last_sour_apple_update = 0;
+    uint32_t csi_sample_divisor = 32;
+    uint32_t csi_ping_interval_ms = 100;
+    uint32_t csi_last_ping_ms = 0;
+    uint32_t csi_router_reconnect_interval_ms = 5000;
+    uint32_t csi_last_reconnect_attempt_ms = 0;
     bool run_setup = true;
+    bool csi_raw_output = false;
+    bool csi_router_disconnected = false;
     void initWiFi(uint8_t scan_mode);
     uint8_t bluetoothScanTime = 5;
     int packets_sent = 0;
@@ -652,6 +662,7 @@ class WiFiScan
     void RunEapolScan(uint8_t scan_mode, uint16_t color);
     void RunProbeScan(uint8_t scan_mode, uint16_t color);
     void RunSAEScan(uint8_t scan_mode, uint16_t color);
+    bool RunCsiScan(uint8_t scan_mode, uint16_t color);
     void RunPacketMonitor(uint8_t scan_mode, uint16_t color);
     void RunBluetoothScan(uint8_t scan_mode, uint16_t color);
     void RunSourApple(uint8_t scan_mode, uint16_t color);
@@ -886,6 +897,11 @@ class WiFiScan
     void renderPacketRate();
     void displayAnalyzerString(String str);
     String security_int_to_string(int security_type);
+    void emitRouterCsiStatus(const String& status, const String& detail = "");
+    bool loadSavedWiFiCredentials(String& ssid, String& password);
+    bool connectToStation(String ssid, String password, bool gui, bool stop_scan_on_failure);
+    bool startRouterCsiCapture();
+    void serviceRouterCsi(uint32_t currentTime);
     void RunSetup();
     int clearList(uint8_t list_type);
     bool addSSID(String essid);
@@ -893,7 +909,11 @@ class WiFiScan
     bool shutdownWiFi();
     bool shutdownBLE();
     bool scanning();
+    bool csiActive();
     bool joinWiFi(String ssid, String password, bool gui = true);
+    bool startCsiPassive(bool raw_output, uint32_t sample_divisor);
+    bool startCsiRouter(bool raw_output, uint32_t sample_divisor, uint32_t ping_interval_ms);
+    void printCsiStatus();
     void getMAC(bool get_sta, uint8_t* mac);
     void changeChannel(int chan = -1);
     void RunAPInfo(uint16_t index, bool do_display = true);
@@ -943,6 +963,7 @@ class WiFiScan
     static void apSnifferCallbackFull(void* buf, wifi_promiscuous_pkt_type_t type);
     static void eapolSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type);
     static void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type);
+    static void csiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type);
     static void pineScanSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type); // Pineapple
     static int extractPineScanChannel(const uint8_t* payload, int len); // Pineapple
     static void multiSSIDSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type); // MultiSSID

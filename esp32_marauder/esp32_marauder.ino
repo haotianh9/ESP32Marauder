@@ -113,6 +113,9 @@ const String PROGMEM version_number = MARAUDER_VERSION;
 #endif
 
 uint32_t currentTime  = 0;
+#ifdef MARAUDER_DEBUG_USB_BOOT
+uint32_t last_debug_heartbeat = 0;
+#endif
 
 // PWM Brightness Control
 #ifdef HAS_SCREEN
@@ -124,6 +127,14 @@ uint32_t currentTime  = 0;
   const uint8_t BL_NUM_LEVELS = 10;
   uint8_t bl_level_idx = 9; // default full brightness
   Preferences bl_prefs;
+#endif
+
+#ifdef MARAUDER_DEBUG_USB_BOOT
+  #define BOOT_DEBUG_PRINTLN(msg) Serial.println(msg)
+  #define BOOT_DEBUG_PRINTF(msg, value) do { Serial.print(msg); Serial.println(value); } while(0)
+#else
+  #define BOOT_DEBUG_PRINTLN(msg) do {} while(0)
+  #define BOOT_DEBUG_PRINTF(msg, value) do {} while(0)
 #endif
 
 // Helper macros for LEDC API compatibility (2.x vs 3.x board package)
@@ -227,6 +238,7 @@ uint32_t currentTime  = 0;
 void setup()
 {
   randomSeed(esp_random());
+  BOOT_DEBUG_PRINTLN("BOOT: setup start");
   
   #ifndef DEVELOPER
     esp_log_level_set("*", ESP_LOG_NONE);
@@ -237,9 +249,12 @@ void setup()
   #endif
 
   Serial.begin(115200);
+  BOOT_DEBUG_PRINTLN("BOOT: Serial.begin done");
 
-  while(!Serial)
+  uint32_t serial_wait_start = millis();
+  while(!Serial && (millis() - serial_wait_start) < 2000)
     delay(10);
+  BOOT_DEBUG_PRINTLN("BOOT: serial wait done");
 
   #ifdef HAS_C5_SD
     sharedSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
@@ -286,6 +301,7 @@ void setup()
   //  delay(10);
 
   Serial.println("ESP-IDF version is: " + String(esp_get_idf_version()));
+  BOOT_DEBUG_PRINTLN("BOOT: idf banner done");
 
   #ifdef HAS_PSRAM
     if (!psramInit()) {
@@ -340,6 +356,7 @@ void setup()
   #endif
 
   settings_obj.begin();
+  BOOT_DEBUG_PRINTLN("BOOT: settings begin done");
 
   const char* type = settings_obj.getSettingType("ChanHop");
 
@@ -349,6 +366,7 @@ void setup()
   }
 
   buffer_obj = Buffer();
+  BOOT_DEBUG_PRINTLN("BOOT: buffer init done");
 
   #ifndef HAS_SIMPLEX_DISPLAY
     #if defined(HAS_SD)
@@ -360,6 +378,7 @@ void setup()
   #endif
 
   wifi_scan_obj.RunSetup();
+  BOOT_DEBUG_PRINTLN("BOOT: wifi scan setup done");
 
   #ifdef HAS_SCREEN
     display_obj.tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -367,10 +386,12 @@ void setup()
   #endif
 
   evil_portal_obj.setup();
+  BOOT_DEBUG_PRINTLN("BOOT: evil portal setup done");
 
   #ifdef HAS_BATTERY
     battery_obj.RunSetup();
   #endif
+  BOOT_DEBUG_PRINTLN("BOOT: battery setup done");
 
   #ifdef HAS_BATTERY
     battery_obj.battery_level = battery_obj.getBatteryLevel();
@@ -390,6 +411,7 @@ void setup()
   #ifdef HAS_GPS
     gps_obj.begin();
   #endif
+  BOOT_DEBUG_PRINTLN("BOOT: gps begin done");
 
   #ifdef HAS_SCREEN  
     display_obj.tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -413,8 +435,10 @@ void setup()
   menu_function_obj.changeMenu(menu_function_obj.current_menu);*/
 
   wifi_scan_obj.StartScan(WIFI_SCAN_OFF);
+  BOOT_DEBUG_PRINTLN("BOOT: wifi scan off");
   
   cli_obj.RunSetup();
+  BOOT_DEBUG_PRINTLN("BOOT: cli setup done");
 }
 
 
@@ -422,6 +446,13 @@ void loop()
 {
   currentTime = millis();
   bool mini = false;
+
+  #ifdef MARAUDER_DEBUG_USB_BOOT
+    if ((currentTime - last_debug_heartbeat) > 5000) {
+      last_debug_heartbeat = currentTime;
+      Serial.println("BOOT: loop heartbeat");
+    }
+  #endif
 
   #ifdef SCREEN_BUFFER
     #ifndef HAS_ILI9341

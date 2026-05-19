@@ -7,6 +7,7 @@
 #endif
 
 static const uint8_t *g_filter_bssid = nullptr;
+static MarauderCsi g_marauder_csi;
 uint8_t *current_act = nullptr;
 
 MacEntry WiFiScan::mac_entries[mac_history_len_half];
@@ -1729,12 +1730,28 @@ void WiFiScan::showNetworkInfo() {
   #endif
 }
 
-bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
-  static const char * btns[] ={text16, ""};
+void WiFiScan::emitRouterCsiStatus(const String& status, const String& detail) {
+  Serial.print(F("CSI_ROUTER STATUS:"));
+  Serial.print(status);
+  if (detail != "") {
+    Serial.print(' ');
+    Serial.print(detail);
+  }
+  Serial.println();
+}
+
+bool WiFiScan::loadSavedWiFiCredentials(String& ssid, String& password) {
+  ssid = settings_obj.loadSetting<String>("ClientSSID");
+  password = settings_obj.loadSetting<String>("ClientPW");
+  return ssid != "";
+}
+
+bool WiFiScan::connectToStation(String ssid, String password, bool gui, bool stop_scan_on_failure) {
   int count = 0;
   
   if ((WiFi.status() == WL_CONNECTED) && (ssid == connected_network) && (ssid != "")) {
     this->wifi_initialized = true;
+    this->wifi_connected = true;
     this->currentScanMode = WIFI_CONNECTED;
     return true;
   }
@@ -1745,12 +1762,19 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
 
   WiFi.disconnect(true);
   delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
   WiFi.mode(WIFI_MODE_STA);
 
-  //esp_wifi_set_mode(WIFI_IF_STA);
-
   this->setMac();
-    
+
+  if (eventId) {
+    WiFi.removeEvent(eventId);
+    eventId = 0;
+  }
+  eventId = WiFi.onEvent(WiFiScan::onWiFiEvent);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(ssid.c_str(), password.c_str());
 
   #ifdef HAS_SCREEN
@@ -1783,7 +1807,17 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
         }
       #endif
       this->wifi_initialized = true;
-      this->StartScan(WIFI_SCAN_OFF, TFT_BLACK);
+      this->wifi_connected = false;
+      this->connected_network = "";
+      this->ip_addr = IPAddress(0, 0, 0, 0);
+      this->gateway = IPAddress(0, 0, 0, 0);
+      this->subnet = IPAddress(0, 0, 0, 0);
+      if (stop_scan_on_failure) {
+        this->StartScan(WIFI_SCAN_OFF, TFT_BLACK);
+      }
+      else {
+        this->shutdownWiFi();
+      }
       #ifdef HAS_SCREEN
         display_obj.tft.setTextWrap(false, false);
       #endif
@@ -1791,6 +1825,7 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
     }
   }
   this->connected_network = ssid;
+  this->wifi_connected = true;
   this->setNetworkInfo();  
   this->showNetworkInfo();
 
@@ -1804,8 +1839,13 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
 
   settings_obj.saveSetting<bool>("ClientSSID", ssid);
   settings_obj.saveSetting<bool>("ClientPW", password);
+  this->csi_router_disconnected = false;
 
   return true;
+}
+
+bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
+  return this->connectToStation(ssid, password, gui, true);
 }
 
 bool WiFiScan::startWiFi(String ssid, String password, bool gui) {
@@ -1867,7 +1907,9 @@ void WiFiScan::initWiFi(uint8_t scan_mode) {
   // Set the channel
   if (scan_mode != WIFI_SCAN_OFF) {
     //Serial.println(F("Initializing WiFi settings..."));
-    this->changeChannel();
+    if (scan_mode != WIFI_SCAN_CSI_ROUTER) {
+      this->changeChannel();
+    }
   
     this->force_pmkid = settings_obj.loadSetting<bool>(text_table4[5]);
     this->force_probe = settings_obj.loadSetting<bool>(text_table4[6]);
@@ -1886,11 +1928,54 @@ bool WiFiScan::scanning() {
     return true;
 }
 
+bool WiFiScan::csiActive() {
+  return g_marauder_csi.active() &&
+         ((this->currentScanMode == WIFI_SCAN_CSI_PASSIVE) ||
+          (this->currentScanMode == WIFI_SCAN_CSI_ROUTER));
+}
+
+bool WiFiScan::startCsiPassive(bool raw_output, uint32_t sample_divisor) {
+  this->csi_raw_output = raw_output;
+  this->csi_sample_divisor = sample_divisor == 0 ? 1 : sample_divisor;
+  this->csi_ping_interval_ms = 0;
+  this->csi_last_ping_ms = 0;
+
+  this->StartScan(WIFI_SCAN_CSI_PASSIVE, raw_output ? TFT_WHITE : TFT_CYAN);
+  return this->csiActive();
+}
+
+bool WiFiScan::startCsiRouter(bool raw_output, uint32_t sample_divisor, uint32_t ping_interval_ms) {
+  this->csi_raw_output = raw_output;
+  this->csi_sample_divisor = sample_divisor == 0 ? 1 : sample_divisor;
+  this->csi_ping_interval_ms = ping_interval_ms == 0 ? 100 : ping_interval_ms;
+  this->csi_last_ping_ms = 0;
+  this->csi_router_reconnect_interval_ms = 5000;
+  this->csi_last_reconnect_attempt_ms = 0;
+  this->csi_router_disconnected = false;
+
+  this->StartScan(WIFI_SCAN_CSI_ROUTER, raw_output ? TFT_WHITE : TFT_CYAN);
+  return this->csiActive();
+}
+
+void WiFiScan::printCsiStatus() {
+  g_marauder_csi.printStatus();
+  if (this->currentScanMode == WIFI_SCAN_CSI_ROUTER) {
+    Serial.print(F("CSI_ROUTER PING_INTERVAL_MS:"));
+    Serial.println(this->csi_ping_interval_ms);
+    Serial.print(F("CSI_ROUTER RECONNECT_INTERVAL_MS:"));
+    Serial.println(this->csi_router_reconnect_interval_ms);
+  }
+}
+
 // Function to prepare to run a specific scan
 void WiFiScan::StartScan(uint8_t scan_mode, uint16_t color) {  
+  bool scan_started = true;
   this->initWiFi(scan_mode);
   if (scan_mode == WIFI_SCAN_OFF)
     StopScan(scan_mode);
+  else if ((scan_mode == WIFI_SCAN_CSI_PASSIVE) ||
+          (scan_mode == WIFI_SCAN_CSI_ROUTER))
+    scan_started = this->RunCsiScan(scan_mode, color);
   else if (scan_mode == WIFI_SCAN_PROBE)
     RunProbeScan(scan_mode, color);
   else if ((scan_mode == WIFI_SCAN_SAE_COMMIT) || (scan_mode == WIFI_ATTACK_SAE_COMMIT))
@@ -2042,7 +2127,7 @@ void WiFiScan::StartScan(uint8_t scan_mode, uint16_t color) {
   else if (scan_mode == WIFI_SCAN_RDP)
     RunPortScanAll(scan_mode, color);
 
-  this->currentScanMode = scan_mode;
+  this->currentScanMode = scan_started ? scan_mode : WIFI_SCAN_OFF;
 }
 
 void WiFiScan::setLEDMode(int mode) {
@@ -2176,7 +2261,15 @@ void WiFiScan::startWiFiAttacks(uint8_t scan_mode, uint16_t color, String title_
 }
 
 bool WiFiScan::shutdownWiFi() {
+  if (g_marauder_csi.active()) {
+    g_marauder_csi.stop();
+  }
+
   if (this->wifi_initialized) {
+    if (eventId) {
+      WiFi.removeEvent(eventId);
+      eventId = 0;
+    }
     if (!this->wifi_connected) {
       esp_wifi_set_promiscuous(false);
       WiFi.disconnect();
@@ -2197,6 +2290,7 @@ bool WiFiScan::shutdownWiFi() {
   
     if (!this->wifi_connected)
       this->wifi_initialized = false;
+    this->csi_router_disconnected = false;
 
     return true;
   }
@@ -2241,6 +2335,8 @@ void WiFiScan::StopScan(uint8_t scan_mode) {
   if ((currentScanMode == WIFI_SCAN_PROBE) ||
   (currentScanMode == WIFI_SCAN_SAE_COMMIT) ||
   (currentScanMode == WIFI_SCAN_AP) ||
+  (currentScanMode == WIFI_SCAN_CSI_PASSIVE) ||
+  (currentScanMode == WIFI_SCAN_CSI_ROUTER) ||
   (currentScanMode == WIFI_SCAN_WAR_DRIVE) ||
   (currentScanMode == WIFI_SCAN_EVIL_PORTAL) ||
   (currentScanMode == WIFI_SCAN_RAW_CAPTURE) ||
@@ -2320,8 +2416,6 @@ void WiFiScan::StopScan(uint8_t scan_mode) {
       this->send_deauth = false;
       this->complete_eapol = 0;
       this->connected_devices = 0;
-
-      WiFi.removeEvent(eventId);
 
       evil_portal_obj.cleanup();
     #endif
@@ -2891,6 +2985,203 @@ void WiFiScan::setWiFiMode(wifi_mode_t mode, wifi_promiscuous_cb_t cb) {
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(cb);
+}
+
+bool WiFiScan::RunCsiScan(uint8_t scan_mode, uint16_t color) {
+  this->setLEDMode(MODE_SNIFF);
+
+  #ifdef HAS_SCREEN
+    this->setupScanDisplayArea(TFT_WHITE, color);
+    #ifdef HAS_FULL_SCREEN
+      display_obj.tft.fillRect(0, 16, TFT_WIDTH, 16, color);
+      display_obj.tft.setTextColor(TFT_BLACK, color);
+      if (scan_mode == WIFI_SCAN_CSI_PASSIVE) {
+        display_obj.tft.drawCentreString("CSI Passive", TFT_WIDTH / 2, 16, 2);
+      }
+      else {
+        display_obj.tft.drawCentreString("CSI Router", TFT_WIDTH / 2, 16, 2);
+      }
+    #endif
+    display_obj.tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  #endif
+
+  if (scan_mode == WIFI_SCAN_CSI_PASSIVE) {
+    if (this->wifi_initialized && !this->wifi_connected) {
+      this->shutdownWiFi();
+    }
+
+    wifi_init_config_t csi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t wifi_status = esp_wifi_init(&csi_cfg);
+    if (wifi_status == ESP_ERR_INVALID_STATE) {
+      esp_wifi_stop();
+      esp_wifi_deinit();
+      wifi_status = esp_wifi_init(&csi_cfg);
+    }
+    if (wifi_status != ESP_OK) {
+#ifdef MARAUDER_DEBUG_USB_BOOT
+      Serial.print(F("CSI_DEBUG init err: "));
+      Serial.println((int)wifi_status);
+#endif
+      return false;
+    }
+    #ifdef HAS_IDF_3
+      esp_wifi_set_country(&country);
+      esp_event_loop_create_default();
+    #endif
+
+    wifi_second_chan_t secondary_channel = WIFI_SECOND_CHAN_NONE;
+    wifi_bandwidth_t bandwidth = WIFI_BW_HT20;
+    if ((this->set_channel >= 5) && (this->set_channel <= 9)) {
+      secondary_channel = WIFI_SECOND_CHAN_BELOW;
+      bandwidth = WIFI_BW_HT40;
+    }
+    else if ((this->set_channel >= 1) && (this->set_channel <= 7)) {
+      secondary_channel = WIFI_SECOND_CHAN_ABOVE;
+      bandwidth = WIFI_BW_HT40;
+    }
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, bandwidth);
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_channel(this->set_channel, secondary_channel);
+    esp_wifi_set_promiscuous(true);
+    g_marauder_csi.setChannel(this->set_channel);
+
+    if (g_marauder_csi.start(
+            MARAUDER_CSI_SOURCE_PASSIVE,
+            this->csi_raw_output ? MARAUDER_CSI_FORMAT_RAW : MARAUDER_CSI_FORMAT_SUMMARY,
+            this->csi_sample_divisor,
+            this->set_channel) != ESP_OK) {
+      this->shutdownWiFi();
+      return false;
+    }
+
+    this->wifi_initialized = true;
+    this->csi_last_ping_ms = 0;
+    initTime = millis();
+    return true;
+  }
+
+  if (!this->wifi_connected && (WiFi.status() != WL_CONNECTED)) {
+    String ssid;
+    String password;
+    if (!this->loadSavedWiFiCredentials(ssid, password)) {
+      this->emitRouterCsiStatus("NO_SAVED_CREDENTIALS", "ACTION:stop");
+      return false;
+    }
+
+    this->emitRouterCsiStatus("CONNECTING", "SSID:" + ssid);
+    if (!this->connectToStation(ssid, password, false, false)) {
+      this->emitRouterCsiStatus("CONNECT_FAILED", "SSID:" + ssid);
+      return false;
+    }
+  }
+
+  if (!this->startRouterCsiCapture()) {
+    this->emitRouterCsiStatus("CSI_START_FAILED", "ACTION:stop");
+    return false;
+  }
+
+  this->emitRouterCsiStatus(
+      "ACTIVE",
+      "SSID:" + this->connected_network + " CH:" + String((uint8_t)WiFi.channel()) +
+          " GW:" + this->gateway.toString());
+  initTime = millis();
+  return true;
+}
+
+bool WiFiScan::startRouterCsiCapture() {
+  wifi_ap_record_t ap_info = {};
+  const uint8_t* filter_bssid = nullptr;
+  if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    filter_bssid = ap_info.bssid;
+  }
+
+  this->setNetworkInfo();
+  g_marauder_csi.setChannel((uint8_t)WiFi.channel());
+  if (g_marauder_csi.start(
+          MARAUDER_CSI_SOURCE_ROUTER,
+          this->csi_raw_output ? MARAUDER_CSI_FORMAT_RAW : MARAUDER_CSI_FORMAT_SUMMARY,
+          this->csi_sample_divisor,
+          (uint8_t)WiFi.channel(),
+          filter_bssid) != ESP_OK) {
+    return false;
+  }
+
+  this->wifi_initialized = true;
+  this->wifi_connected = true;
+  this->csi_last_ping_ms = millis();
+  this->csi_last_reconnect_attempt_ms = 0;
+  this->csi_router_disconnected = false;
+  return true;
+}
+
+void WiFiScan::serviceRouterCsi(uint32_t currentTime) {
+  if ((WiFi.status() != WL_CONNECTED) || !this->wifi_connected) {
+    if (!this->csi_router_disconnected) {
+      this->emitRouterCsiStatus("LINK_DOWN", "ACTION:reconnect");
+      this->csi_router_disconnected = true;
+    }
+
+    if (g_marauder_csi.active()) {
+      g_marauder_csi.stop();
+    }
+
+    if ((currentTime - this->csi_last_reconnect_attempt_ms) <
+        this->csi_router_reconnect_interval_ms) {
+      return;
+    }
+
+    this->csi_last_reconnect_attempt_ms = currentTime;
+
+    String ssid;
+    String password;
+    if (!this->loadSavedWiFiCredentials(ssid, password)) {
+      this->emitRouterCsiStatus("NO_SAVED_CREDENTIALS", "ACTION:stop");
+      this->StartScan(WIFI_SCAN_OFF, TFT_BLACK);
+      return;
+    }
+
+    this->emitRouterCsiStatus("RECONNECTING", "SSID:" + ssid);
+    if (!this->connectToStation(ssid, password, false, false)) {
+      this->currentScanMode = WIFI_SCAN_CSI_ROUTER;
+      this->emitRouterCsiStatus("RECONNECT_FAILED", "SSID:" + ssid);
+      return;
+    }
+
+    this->currentScanMode = WIFI_SCAN_CSI_ROUTER;
+    if (!this->startRouterCsiCapture()) {
+      this->emitRouterCsiStatus("CSI_REARM_FAILED", "SSID:" + ssid);
+      return;
+    }
+
+    this->emitRouterCsiStatus(
+        "RECONNECTED",
+        "SSID:" + ssid + " CH:" + String((uint8_t)WiFi.channel()) +
+            " GW:" + this->gateway.toString());
+    return;
+  }
+
+  if (!g_marauder_csi.active()) {
+    if (this->startRouterCsiCapture()) {
+      this->emitRouterCsiStatus(
+          "ACTIVE",
+          "SSID:" + this->connected_network + " CH:" + String((uint8_t)WiFi.channel()) +
+              " GW:" + this->gateway.toString());
+    }
+    else {
+      this->emitRouterCsiStatus("CSI_REARM_FAILED", "ACTION:retry");
+    }
+    return;
+  }
+
+  if ((this->gateway != IPAddress(0, 0, 0, 0)) &&
+      (currentTime - this->csi_last_ping_ms >= this->csi_ping_interval_ms)) {
+    this->csi_last_ping_ms = millis();
+    Ping.ping(this->gateway, 1);
+  }
 }
 
 void WiFiScan::prepareScanStage(uint16_t color_1, uint16_t color_2) {
@@ -4770,9 +5061,17 @@ void WiFiScan::tagPOI(const char* label) {
 }
 
 void WiFiScan::onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  #ifdef HAS_SCREEN
-    extern WiFiScan wifi_scan_obj;
+  extern WiFiScan wifi_scan_obj;
 
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    wifi_scan_obj.wifi_connected = true;
+    wifi_scan_obj.setNetworkInfo();
+  }
+  else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifi_scan_obj.wifi_connected = false;
+  }
+
+  #ifdef HAS_SCREEN
     switch (event) {
       case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
         char macStr[18];
@@ -8870,6 +9169,7 @@ void WiFiScan::changeChannel(int chan) {
   if (chan != -1)
     this->set_channel = chan;
   esp_wifi_set_channel(this->set_channel, WIFI_SECOND_CHAN_NONE);
+  g_marauder_csi.setChannel(this->set_channel);
   delay(1);
   #ifdef HAS_SCREEN
     if (this->currentScanMode == WIFI_SCAN_CHAN_ANALYZER) {
@@ -9796,6 +10096,10 @@ uint16_t WiFiScan::rssiToColor(int8_t rssi) {
 // Function for updating scan status
 void WiFiScan::main(uint32_t currentTime)
 {
+  if (g_marauder_csi.active()) {
+    g_marauder_csi.service();
+  }
+
   // WiFi operations
   if ((currentScanMode == WIFI_SCAN_PROBE) ||
   (currentScanMode == WIFI_SCAN_AP) ||
@@ -9893,6 +10197,9 @@ void WiFiScan::main(uint32_t currentTime)
         this->signalAnalyzerLoop(currentTime);
       #endif
     }
+  }
+  else if (currentScanMode == WIFI_SCAN_CSI_ROUTER) {
+    this->serviceRouterCsi(currentTime);
   }
   else if (currentScanMode == WIFI_PING_SCAN) {
     this->pingScan();
@@ -10345,4 +10652,9 @@ void WiFiScan::main(uint32_t currentTime)
   else {
     this->wifi_connected = false;
   }
+}
+
+void WiFiScan::csiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  (void)buf;
+  (void)type;
 }

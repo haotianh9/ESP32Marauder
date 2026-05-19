@@ -255,6 +255,7 @@ void CommandLine::runCommand(String input) {
     Serial.println(HELP_SNIFF_PMKID_CMD);
     Serial.println(HELP_SNIFF_SAE_CMD);
     Serial.println(HELP_STOPSCAN_CMD);
+    Serial.println(HELP_CSI_CMD);
     #ifdef HAS_GPS
       Serial.println(HELP_WARDRIVE_CMD);
       Serial.println(HELP_WARDRIVEPOI_CMD);
@@ -314,6 +315,9 @@ void CommandLine::runCommand(String input) {
       Serial.println(F("END OF NMEA STREAM"));
     else if(old_scan_mode == WIFI_SCAN_GPS_DATA)
       Serial.println(F("Stopping GPS data updates"));
+    else if ((old_scan_mode == WIFI_SCAN_CSI_PASSIVE) ||
+             (old_scan_mode == WIFI_SCAN_CSI_ROUTER))
+      Serial.println(F("Stopping CSI capture"));
     else
       Serial.println(F("Stopping WiFi tran/recv"));
 
@@ -527,6 +531,104 @@ void CommandLine::runCommand(String input) {
 
   else if (cmd_args.get(0) == REBOOT_CMD)
     ESP.restart();
+  else if (cmd_args.get(0) == CSI_CMD) {
+    int start_arg = this->argSearch(&cmd_args, "-start");
+    int status_arg = this->argSearch(&cmd_args, "-status");
+    int stop_arg = this->argSearch(&cmd_args, "-stop");
+
+    if (status_arg != -1) {
+      wifi_scan_obj.printCsiStatus();
+      return;
+    }
+
+    if (stop_arg != -1) {
+      if (wifi_scan_obj.csiActive()) {
+        wifi_scan_obj.StartScan(WIFI_SCAN_OFF);
+        Serial.println(F("Stopping CSI capture"));
+      }
+      else {
+        Serial.println(F("CSI capture is not active"));
+      }
+      return;
+    }
+
+    if (start_arg == -1) {
+      Serial.println(HELP_CSI_CMD);
+      return;
+    }
+
+    int src_arg = this->argSearch(&cmd_args, "-src");
+    int fmt_arg = this->argSearch(&cmd_args, "-fmt");
+    int sample_arg = this->argSearch(&cmd_args, "-sample");
+    int ping_arg = this->argSearch(&cmd_args, "-ping");
+
+    if ((src_arg == -1) || (fmt_arg == -1) ||
+        !this->checkValueExists(&cmd_args, src_arg) ||
+        !this->checkValueExists(&cmd_args, fmt_arg)) {
+      Serial.println(HELP_CSI_CMD);
+      return;
+    }
+
+    String src_value = this->toLowerCase(cmd_args.get(src_arg + 1));
+    String fmt_value = this->toLowerCase(cmd_args.get(fmt_arg + 1));
+    bool raw_output = fmt_value == "raw";
+
+    if ((fmt_value != "summary") && (fmt_value != "raw")) {
+      Serial.println(F("CSI format must be summary or raw"));
+      return;
+    }
+
+    uint32_t sample_divisor = raw_output ? 128 : 32;
+    if (sample_arg != -1 && this->checkValueExists(&cmd_args, sample_arg)) {
+      int sample_value = cmd_args.get(sample_arg + 1).toInt();
+      sample_divisor = sample_value > 0 ? sample_value : 1;
+    }
+
+    uint32_t ping_hz = raw_output ? 2 : 10;
+    if (ping_arg != -1 && this->checkValueExists(&cmd_args, ping_arg)) {
+      int ping_value = cmd_args.get(ping_arg + 1).toInt();
+      ping_hz = ping_value > 0 ? ping_value : 1;
+    }
+    uint32_t ping_interval_ms = ping_hz > 0 ? (1000UL / ping_hz) : 100;
+    if (ping_interval_ms == 0) {
+      ping_interval_ms = 1;
+    }
+
+    if (wifi_scan_obj.csiActive()) {
+      Serial.println(F("Stop the current CSI capture first"));
+      return;
+    }
+
+    if (wifi_scan_obj.scanning() && wifi_scan_obj.currentScanMode != WIFI_CONNECTED) {
+      Serial.println(F("Stop the current scan first"));
+      return;
+    }
+
+    if (src_value == "passive") {
+      if (wifi_scan_obj.wifi_connected || (wifi_scan_obj.currentScanMode == WIFI_CONNECTED)) {
+        Serial.println(F("Stop the current WiFi connection before passive CSI"));
+        return;
+      }
+
+      Serial.print(F("Starting passive CSI capture. Stop with "));
+      Serial.println(STOPSCAN_CMD);
+      if (!wifi_scan_obj.startCsiPassive(raw_output, sample_divisor)) {
+        Serial.println(F("Unable to start passive CSI"));
+      }
+      return;
+    }
+    else if (src_value == "router") {
+      Serial.print(F("Starting router CSI capture. Stop with "));
+      Serial.println(STOPSCAN_CMD);
+      if (!wifi_scan_obj.startCsiRouter(raw_output, sample_divisor, ping_interval_ms)) {
+        Serial.println(F("Unable to start router CSI"));
+      }
+      return;
+    }
+
+    Serial.println(F("CSI source must be passive or router"));
+    return;
+  }
 
   //// WiFi/Bluetooth Scan/Attack commands
   if (!wifi_scan_obj.scanning()) {
@@ -1343,14 +1445,26 @@ void CommandLine::runCommand(String input) {
   }
   else if (cmd_args.get(0) == JOIN_CMD) {
     int ap_sw = this->argSearch(&cmd_args, "-a");
+    int name_sw = this->argSearch(&cmd_args, "-n");
     int pw_sw = this->argSearch(&cmd_args, "-p");
     int s_sw  = this->argSearch(&cmd_args, "-s");
 
-    if ((ap_sw != -1) && (pw_sw != -1)) {
+    if ((name_sw != -1) && (pw_sw != -1)) {
+      String ssid = cmd_args.get(name_sw + 1);
+      String password = cmd_args.get(pw_sw + 1);
+      Serial.println("Using SSID: " + ssid + " Password: <redacted>");
+      wifi_scan_obj.joinWiFi(ssid, password, false);
+      #ifdef HAS_SCREEN
+        #ifdef HAS_MINI_KB
+          menu_function_obj.changeMenu(menu_function_obj.current_menu);
+        #endif
+      #endif
+    }
+    else if ((ap_sw != -1) && (pw_sw != -1)) {
       int index = cmd_args.get(ap_sw + 1).toInt();
       String password = cmd_args.get(pw_sw + 1);
       AccessPoint access_point = access_points->get(index);
-      Serial.println("Using SSID: " + (String)access_point.essid + " Password: " + (String)password);
+      Serial.println("Using SSID: " + (String)access_point.essid + " Password: <redacted>");
       //wifi_scan_obj.currentScanMode = LV_JOIN_WIFI;
       //wifi_scan_obj.StartScan(LV_JOIN_WIFI, TFT_YELLOW); 
       wifi_scan_obj.joinWiFi(access_point.essid, password, false);
@@ -1364,7 +1478,8 @@ void CommandLine::runCommand(String input) {
       String ssid = settings_obj.loadSetting<String>("ClientSSID");
       String pw = settings_obj.loadSetting<String>("ClientPW");
 
-      if ((ssid != "") && (pw != "")) {
+      if (ssid != "") {
+        Serial.println("Using saved WiFi credentials for SSID: " + ssid);
         wifi_scan_obj.joinWiFi(ssid, pw, false);
         #ifdef HAS_SCREEN
           menu_function_obj.changeMenu(menu_function_obj.current_menu);

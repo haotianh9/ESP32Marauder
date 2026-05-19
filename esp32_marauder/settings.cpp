@@ -338,9 +338,14 @@ void Settings::printJsonSettings(String json_string) {
 
   Serial.println("Settings\n----------------------------------------------");
   for (int i = 0; i < (int)json["Settings"].size(); i++) {
-    Serial.println("Name: " + json["Settings"][i]["name"].as<String>());
+    String name = json["Settings"][i]["name"].as<String>();
+    String value = json["Settings"][i]["value"].as<String>();
+    if (name == "ClientPW")
+      value = "<redacted>";
+
+    Serial.println("Name: " + name);
     Serial.println("Type: " + json["Settings"][i]["type"].as<String>());
-    Serial.println("Value: " + json["Settings"][i]["value"].as<String>() + "\n");
+    Serial.println("Value: " + value + "\n");
   }
 }
 
