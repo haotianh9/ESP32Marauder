@@ -20,10 +20,14 @@
     #include "esp_netif.h"
     #include "esp_netif_net_stack.h"
   }
+#else
+  #include "esp_netif.h"
 #endif
 
 //#include <WiFi.h>
 #include <ESP32Ping.h>
+#include <WiFiUdp.h>
+#include <ping/ping_sock.h>
 #include "EvilPortal.h"
 #include <math.h>
 #include "esp_wifi.h"
@@ -335,13 +339,28 @@ class WiFiScan
     uint32_t csi_last_ping_ms = 0;
     uint32_t csi_router_reconnect_interval_ms = 5000;
     uint32_t csi_last_reconnect_attempt_ms = 0;
+    uint32_t csi_duration_ms = 0;
+    uint32_t csi_started_ms = 0;
     bool run_setup = true;
     bool csi_raw_output = false;
     bool csi_router_disconnected = false;
+    bool csi_filter_mac = false;
+    uint8_t csi_filter_bssid[6] = {0};
+    esp_ping_handle_t csi_router_ping_handle = nullptr;
+    bool wifi_session_active = false;
+    bool wifi_session_maintain = false;
+    String wifi_session_ssid = "";
+    String wifi_session_password = "";
+    uint32_t wifi_session_ping_interval_ms = 1000;
+    uint32_t wifi_session_rssi_interval_ms = 1000;
+    uint32_t wifi_session_last_ping_ms = 0;
+    uint32_t wifi_session_last_rssi_ms = 0;
+    uint32_t wifi_session_reconnect_interval_ms = 5000;
+    uint32_t wifi_session_last_reconnect_attempt_ms = 0;
     void initWiFi(uint8_t scan_mode);
     uint8_t bluetoothScanTime = 5;
     int packets_sent = 0;
-    const wifi_promiscuous_filter_t filt = {.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA};
+    const wifi_promiscuous_filter_t filt = {.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_CTRL | WIFI_PROMIS_FILTER_MASK_DATA};
     #ifdef HAS_BT
       NimBLEScan* pBLEScan;
     #endif
@@ -746,14 +765,24 @@ class WiFiScan
 
     // Stuff for RAW stats
     uint32_t mgmt_frames = 0;
+    uint32_t ctrl_frames = 0;
     uint32_t data_frames = 0;
     uint32_t beacon_frames = 0;
     uint32_t req_frames = 0;
     uint32_t resp_frames = 0;
     uint32_t deauth_frames = 0;
     uint32_t eapol_frames = 0;
+    uint32_t fcs_fail_reported = 0;
     uint32_t complete_eapol = 0;
     uint32_t flock_devices = 0;
+    int32_t packet_rssi_sum = 0;
+    uint32_t packet_rssi_samples = 0;
+    uint32_t last_link_ping_rtt_ms = 0;
+    uint32_t last_link_ping_loss_pct = 0;
+    uint16_t unique_transmitter_count = 0;
+    uint16_t unique_receiver_count = 0;
+    uint32_t unique_transmitter_hashes[128] = {0};
+    uint32_t unique_receiver_hashes[128] = {0};
     int8_t min_rssi = 0;
     int8_t max_rssi = -128;
 
@@ -797,6 +826,7 @@ class WiFiScan
     bool wifi_initialized = false;
     bool ble_initialized = false;
     bool wifi_connected = false;
+    uint16_t wifi_last_disconnect_reason = 0;
 
     String free_ram = "";
     String old_free_ram = "";
@@ -898,10 +928,21 @@ class WiFiScan
     void displayAnalyzerString(String str);
     String security_int_to_string(int security_type);
     void emitRouterCsiStatus(const String& status, const String& detail = "");
+    void emitWiFiEvent(const String& event, const String& ssid = "", const String& detail = "");
+    void emitWiFiStatus(const String& state);
+    void emitLinkRssi();
     bool loadSavedWiFiCredentials(String& ssid, String& password);
-    bool connectToStation(String ssid, String password, bool gui, bool stop_scan_on_failure);
+    bool loadRouterCredentials(String& ssid, String& password);
+    bool connectToStation(
+        String ssid,
+        String password,
+        bool gui,
+        bool stop_scan_on_failure,
+        bool persist_credentials = true);
     bool startRouterCsiCapture();
+    void stopRouterCsiPingSession();
     void serviceRouterCsi(uint32_t currentTime);
+    void serviceWiFiSession(uint32_t currentTime);
     void RunSetup();
     int clearList(uint8_t list_type);
     bool addSSID(String essid);
@@ -911,8 +952,29 @@ class WiFiScan
     bool scanning();
     bool csiActive();
     bool joinWiFi(String ssid, String password, bool gui = true);
-    bool startCsiPassive(bool raw_output, uint32_t sample_divisor);
-    bool startCsiRouter(bool raw_output, uint32_t sample_divisor, uint32_t ping_interval_ms);
+    bool startSessionWiFi(String ssid, String password, bool gui = false);
+    void printWiFiStatus();
+    bool setWiFiMaintain(uint32_t ping_interval_ms, uint32_t rssi_interval_ms);
+    bool disconnectSessionWiFi(bool clear_session = true);
+    bool runActiveScan(uint8_t channel, uint32_t duration_ms, const String& target_ssid = "");
+    bool runLinkPing(const String& target, uint32_t count = 10);
+    bool runLinkThroughput(
+        const String& proto,
+        const String& target,
+        uint16_t port,
+        uint32_t duration_ms);
+    void emitPacketSummary();
+    bool startCsiPassive(
+        bool raw_output,
+        uint32_t sample_divisor,
+        uint32_t duration_ms = 0,
+        const uint8_t* mac_filter = nullptr);
+    bool startCsiRouter(
+        bool raw_output,
+        uint32_t sample_divisor,
+        uint32_t ping_interval_ms,
+        uint32_t duration_ms = 0,
+        const uint8_t* mac_filter = nullptr);
     void printCsiStatus();
     void getMAC(bool get_sta, uint8_t* mac);
     void changeChannel(int chan = -1);

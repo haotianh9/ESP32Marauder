@@ -395,10 +395,10 @@
     //#define HAS_NEOPIXEL_LED
     //#define HAS_PWR_MGMT
     //#define HAS_SCREEN
-    #define HAS_GPS
-    #define HAS_SD
-    #define USE_SD
-    #define HAS_PSRAM
+    // FlipperGotchi owns durable storage on the Flipper SD card and the working
+    // GPIO-UART runtime does not use ESP32-local GPS/SD peripherals.
+    // Keep the Flipper board profile aligned with the proven runtime path for
+    // both debug and release builds so the UART command surface stays stable.
     //#define HAS_TEMP_SENSOR
   #endif
 

@@ -210,13 +210,22 @@ void CommandLine::startScanFromCLI(int scan_mode, uint16_t color, String scan_na
 void CommandLine::runCommand(String input) {
   if (input == "") return;
 
+  LinkedList<String> cmd_args = this->parseCommand(input, " ");
+  String serial_echo = input;
+
+  if ((cmd_args.get(0) == JOIN_CMD) || (cmd_args.get(0) == WIFI_CMD)) {
+    int pw_arg = this->argSearch(&cmd_args, "-p");
+    if ((pw_arg != -1) && this->checkValueExists(&cmd_args, pw_arg)) {
+      String password = cmd_args.get(pw_arg + 1);
+      serial_echo.replace(password, "<redacted>");
+    }
+  }
+
   if(wifi_scan_obj.scanning() && wifi_scan_obj.currentScanMode == WIFI_SCAN_GPS_NMEA){
     if(input != STOPSCAN_CMD) return;    
   }
   else
-    Serial.println("#" + input);
-
-  LinkedList<String> cmd_args = this->parseCommand(input, " ");
+    Serial.println("#" + serial_echo);
   
   //// Admin commands
   // Help
@@ -234,6 +243,7 @@ void CommandLine::runCommand(String input) {
     Serial.println(HELP_NMEA_CMD);
     Serial.println(HELP_GPS_POI_CMD);
     Serial.println(HELP_GPS_TRACKER_CMD);
+    Serial.println(HELP_FGCAP_CMD);
     
     // WiFi sniff/scan
     Serial.println(HELP_EVIL_PORTAL_CMD);
@@ -256,6 +266,7 @@ void CommandLine::runCommand(String input) {
     Serial.println(HELP_SNIFF_SAE_CMD);
     Serial.println(HELP_STOPSCAN_CMD);
     Serial.println(HELP_CSI_CMD);
+    Serial.println(HELP_FGSCAN_CMD);
     #ifdef HAS_GPS
       Serial.println(HELP_WARDRIVE_CMD);
       Serial.println(HELP_WARDRIVEPOI_CMD);
@@ -279,6 +290,7 @@ void CommandLine::runCommand(String input) {
     Serial.println(HELP_SAVE_CMD);
     Serial.println(HELP_LOAD_CMD);
     Serial.println(HELP_JOIN_CMD);
+    Serial.println(HELP_WIFI_CMD);
     Serial.println(HELP_MAC_CMD_A);
     Serial.println(HELP_MAC_CMD_B);
     Serial.println(HELP_MAC_CMD_C);
@@ -464,7 +476,9 @@ void CommandLine::runCommand(String input) {
 
     if (ch_set != -1) {
       wifi_scan_obj.set_channel = cmd_args.get(ch_set + 1).toInt();
-      wifi_scan_obj.changeChannel();
+      if (wifi_scan_obj.wifi_initialized) {
+        wifi_scan_obj.changeChannel();
+      }
       Serial.println(wifi_scan_obj.set_channel);
     }
     Serial.println(wifi_scan_obj.set_channel);
@@ -531,6 +545,150 @@ void CommandLine::runCommand(String input) {
 
   else if (cmd_args.get(0) == REBOOT_CMD)
     ESP.restart();
+  else if (cmd_args.get(0) == FGCAP_CMD) {
+    Serial.println(F("FGCAP API:2 FLAGS:CSI,WIFI_SESSION,LINK_RSSI,RAW_CSI"));
+    return;
+  }
+  else if (cmd_args.get(0) == WIFI_CMD) {
+    int connect_arg = this->argSearch(&cmd_args, "-connect");
+    int status_arg = this->argSearch(&cmd_args, "-status");
+    int disconnect_arg = this->argSearch(&cmd_args, "-disconnect");
+    int maintain_arg = this->argSearch(&cmd_args, "-maintain");
+    int throughput_arg = this->argSearch(&cmd_args, "-throughput");
+    int name_arg = this->argSearch(&cmd_args, "-n");
+    int pw_arg = this->argSearch(&cmd_args, "-p");
+    int ping_arg = this->argSearch(&cmd_args, "-ping");
+    int rssi_arg = this->argSearch(&cmd_args, "-rssi");
+    int target_arg = this->argSearch(&cmd_args, "-target");
+    int count_arg = this->argSearch(&cmd_args, "-count");
+    int proto_arg = this->argSearch(&cmd_args, "-proto");
+    int port_arg = this->argSearch(&cmd_args, "-port");
+    int duration_arg = this->argSearch(&cmd_args, "-duration");
+
+    if (status_arg != -1) {
+      wifi_scan_obj.printWiFiStatus();
+      return;
+    }
+
+    if (disconnect_arg != -1) {
+      wifi_scan_obj.disconnectSessionWiFi(true);
+      return;
+    }
+
+    if (connect_arg != -1) {
+      if ((name_arg == -1) || (pw_arg == -1) ||
+          !this->checkValueExists(&cmd_args, name_arg) ||
+          !this->checkValueExists(&cmd_args, pw_arg)) {
+        Serial.println(HELP_WIFI_CMD);
+        return;
+      }
+
+      String ssid = cmd_args.get(name_arg + 1);
+      String password = cmd_args.get(pw_arg + 1);
+      Serial.println("Using session SSID: " + ssid + " Password: <redacted>");
+      if (!wifi_scan_obj.startSessionWiFi(ssid, password, false)) {
+        Serial.println(F("Unable to start WiFi session"));
+      }
+      return;
+    }
+
+    if (maintain_arg != -1) {
+      uint32_t ping_hz = 1;
+      uint32_t rssi_hz = 1;
+
+      if ((ping_arg != -1) && this->checkValueExists(&cmd_args, ping_arg)) {
+        int ping_value = cmd_args.get(ping_arg + 1).toInt();
+        ping_hz = ping_value > 0 ? ping_value : 1;
+      }
+      if ((rssi_arg != -1) && this->checkValueExists(&cmd_args, rssi_arg)) {
+        int rssi_value = cmd_args.get(rssi_arg + 1).toInt();
+        rssi_hz = rssi_value > 0 ? rssi_value : 1;
+      }
+
+      uint32_t ping_interval_ms = ping_hz > 0 ? (1000UL / ping_hz) : 1000;
+      uint32_t rssi_interval_ms = rssi_hz > 0 ? (1000UL / rssi_hz) : 1000;
+      if (ping_interval_ms == 0) ping_interval_ms = 1;
+      if (rssi_interval_ms == 0) rssi_interval_ms = 1;
+
+      if (!wifi_scan_obj.setWiFiMaintain(ping_interval_ms, rssi_interval_ms)) {
+        Serial.println(F("Unable to enable WiFi maintain mode"));
+      }
+      return;
+    }
+
+    if ((ping_arg != -1) && (maintain_arg == -1)) {
+      if ((target_arg == -1) || !this->checkValueExists(&cmd_args, target_arg)) {
+        Serial.println(HELP_WIFI_CMD);
+        return;
+      }
+
+      String target = cmd_args.get(target_arg + 1);
+      uint32_t count = 10;
+      if ((count_arg != -1) && this->checkValueExists(&cmd_args, count_arg)) {
+        int count_value = cmd_args.get(count_arg + 1).toInt();
+        count = count_value > 0 ? (uint32_t)count_value : 10;
+      }
+
+      wifi_scan_obj.runLinkPing(target, count);
+      return;
+    }
+
+    if (throughput_arg != -1) {
+      if ((proto_arg == -1) || (target_arg == -1) || (port_arg == -1) || (duration_arg == -1) ||
+          !this->checkValueExists(&cmd_args, proto_arg) ||
+          !this->checkValueExists(&cmd_args, target_arg) ||
+          !this->checkValueExists(&cmd_args, port_arg) ||
+          !this->checkValueExists(&cmd_args, duration_arg)) {
+        Serial.println(HELP_WIFI_CMD);
+        return;
+      }
+
+      String proto = this->toLowerCase(cmd_args.get(proto_arg + 1));
+      String target = cmd_args.get(target_arg + 1);
+      uint16_t port = (uint16_t)cmd_args.get(port_arg + 1).toInt();
+      uint32_t duration_ms = (uint32_t)cmd_args.get(duration_arg + 1).toInt();
+      if ((port == 0) || (duration_ms == 0)) {
+        Serial.println(HELP_WIFI_CMD);
+        return;
+      }
+
+      wifi_scan_obj.runLinkThroughput(proto, target, port, duration_ms);
+      return;
+    }
+
+    Serial.println(HELP_WIFI_CMD);
+    return;
+  }
+  else if (cmd_args.get(0) == FGSCAN_CMD) {
+    int type_arg = this->argSearch(&cmd_args, "-type");
+    int ssid_arg = this->argSearch(&cmd_args, "-ssid");
+    int channel_arg = this->argSearch(&cmd_args, "-channel");
+    int duration_arg = this->argSearch(&cmd_args, "-duration");
+
+    if ((type_arg == -1) || (channel_arg == -1) || (duration_arg == -1) ||
+        !this->checkValueExists(&cmd_args, type_arg) ||
+        !this->checkValueExists(&cmd_args, channel_arg) ||
+        !this->checkValueExists(&cmd_args, duration_arg)) {
+      Serial.println(HELP_FGSCAN_CMD);
+      return;
+    }
+
+    String type_value = this->toLowerCase(cmd_args.get(type_arg + 1));
+    uint8_t channel = (uint8_t)cmd_args.get(channel_arg + 1).toInt();
+    uint32_t duration_ms = (uint32_t)cmd_args.get(duration_arg + 1).toInt();
+    if ((type_value != "active") || (channel < 1) || (channel > 14) || (duration_ms == 0)) {
+      Serial.println(HELP_FGSCAN_CMD);
+      return;
+    }
+
+    String ssid = "";
+    if ((ssid_arg != -1) && this->checkValueExists(&cmd_args, ssid_arg)) {
+      ssid = cmd_args.get(ssid_arg + 1);
+    }
+
+    wifi_scan_obj.runActiveScan(channel, duration_ms, ssid);
+    return;
+  }
   else if (cmd_args.get(0) == CSI_CMD) {
     int start_arg = this->argSearch(&cmd_args, "-start");
     int status_arg = this->argSearch(&cmd_args, "-status");
@@ -561,6 +719,8 @@ void CommandLine::runCommand(String input) {
     int fmt_arg = this->argSearch(&cmd_args, "-fmt");
     int sample_arg = this->argSearch(&cmd_args, "-sample");
     int ping_arg = this->argSearch(&cmd_args, "-ping");
+    int duration_arg = this->argSearch(&cmd_args, "-duration");
+    int filter_arg = this->argSearch(&cmd_args, "-filter-mac");
 
     if ((src_arg == -1) || (fmt_arg == -1) ||
         !this->checkValueExists(&cmd_args, src_arg) ||
@@ -594,6 +754,31 @@ void CommandLine::runCommand(String input) {
       ping_interval_ms = 1;
     }
 
+    uint32_t duration_ms = 0;
+    if ((duration_arg != -1) && this->checkValueExists(&cmd_args, duration_arg)) {
+      int duration_seconds = cmd_args.get(duration_arg + 1).toInt();
+      duration_ms = duration_seconds > 0 ? (uint32_t)duration_seconds * 1000UL : 0;
+    }
+
+    uint8_t filter_bssid[6] = {0};
+    const uint8_t* filter_ptr = nullptr;
+    if ((filter_arg != -1) && this->checkValueExists(&cmd_args, filter_arg)) {
+      String mac_str = cmd_args.get(filter_arg + 1);
+      if (sscanf(
+              mac_str.c_str(),
+              "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+              &filter_bssid[0],
+              &filter_bssid[1],
+              &filter_bssid[2],
+              &filter_bssid[3],
+              &filter_bssid[4],
+              &filter_bssid[5]) != 6) {
+        Serial.println(F("CSI filter MAC must be XX:XX:XX:XX:XX:XX"));
+        return;
+      }
+      filter_ptr = filter_bssid;
+    }
+
     if (wifi_scan_obj.csiActive()) {
       Serial.println(F("Stop the current CSI capture first"));
       return;
@@ -612,7 +797,11 @@ void CommandLine::runCommand(String input) {
 
       Serial.print(F("Starting passive CSI capture. Stop with "));
       Serial.println(STOPSCAN_CMD);
-      if (!wifi_scan_obj.startCsiPassive(raw_output, sample_divisor)) {
+      if (!wifi_scan_obj.startCsiPassive(
+              raw_output,
+              sample_divisor,
+              duration_ms,
+              filter_ptr)) {
         Serial.println(F("Unable to start passive CSI"));
       }
       return;
@@ -620,7 +809,12 @@ void CommandLine::runCommand(String input) {
     else if (src_value == "router") {
       Serial.print(F("Starting router CSI capture. Stop with "));
       Serial.println(STOPSCAN_CMD);
-      if (!wifi_scan_obj.startCsiRouter(raw_output, sample_divisor, ping_interval_ms)) {
+      if (!wifi_scan_obj.startCsiRouter(
+              raw_output,
+              sample_divisor,
+              ping_interval_ms,
+              duration_ms,
+              filter_ptr)) {
         Serial.println(F("Unable to start router CSI"));
       }
       return;
@@ -797,7 +991,9 @@ void CommandLine::runCommand(String input) {
       
       if (ch_sw != -1) {
         wifi_scan_obj.set_channel = cmd_args.get(ch_sw + 1).toInt();
-        wifi_scan_obj.changeChannel();
+        if (wifi_scan_obj.wifi_initialized) {
+          wifi_scan_obj.changeChannel();
+        }
         Serial.println("Set channel: " + (String)wifi_scan_obj.set_channel);
         
       }

@@ -3,7 +3,7 @@
 #ifndef EvilPortal_h
 #define EvilPortal_h
 
-#include "ESPAsyncWebServer.h"
+#include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <DNSServer.h>
 #include <WiFi.h>
@@ -40,7 +40,7 @@ extern Buffer buffer_obj;
 extern char apName[MAX_AP_NAME_SIZE];
 
 #ifndef HAS_PSRAM
-  char index_html[MAX_HTML_SIZE] = "TEST";
+  extern char index_html[MAX_HTML_SIZE];
 #else
   extern char* index_html;
 #endif

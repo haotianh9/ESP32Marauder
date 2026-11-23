@@ -46,6 +46,7 @@ class MarauderCsi {
 
     void printStatus() const;
     void service();
+    void handleRxShim(const wifi_csi_info_t* info);
 
   private:
     static const uint8_t kQueueDepth = 4;
@@ -87,6 +88,7 @@ class MarauderCsi {
     static const char* sourceName(MarauderCsiSource source);
     static const char* formatName(MarauderCsiFormat format);
 
+    void handleRx(const wifi_csi_info_t* info);
     void resetCounters();
     bool enqueueFrame(const wifi_csi_info_t* info, uint32_t sample_index);
     void emitSummary(const PendingFrame& frame);
@@ -109,6 +111,8 @@ class MarauderCsi {
     volatile uint8_t queue_head_ = 0;
     volatile uint8_t queue_tail_ = 0;
     volatile uint8_t queue_count_ = 0;
+    uint32_t last_emit_ms_ = 0;
+    uint8_t debug_frames_logged_ = 0;
 };
 
 #endif

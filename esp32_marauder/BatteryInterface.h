@@ -6,11 +6,11 @@
 #include <Arduino.h>
 
 #include "configs.h"
-#include "Adafruit_MAX1704X.h"
+#include <Adafruit_MAX1704X.h>
 
 #ifdef HAS_AXP2101
   #define XPOWERS_CHIP_AXP2101
-  #include "XPowersLib.h"
+  #include <XPowersLib.h>
 #endif
 
 #include <Wire.h>

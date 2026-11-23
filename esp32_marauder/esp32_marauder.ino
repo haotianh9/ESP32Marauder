@@ -114,6 +114,8 @@ const String PROGMEM version_number = MARAUDER_VERSION;
 
 uint32_t currentTime  = 0;
 #ifdef MARAUDER_DEBUG_USB_BOOT
+static volatile uint32_t boot_probe_csi_frames = 0;
+static volatile uint32_t boot_probe_promisc_frames = 0;
 uint32_t last_debug_heartbeat = 0;
 #endif
 
@@ -135,6 +137,132 @@ uint32_t last_debug_heartbeat = 0;
 #else
   #define BOOT_DEBUG_PRINTLN(msg) do {} while(0)
   #define BOOT_DEBUG_PRINTF(msg, value) do {} while(0)
+#endif
+
+#ifdef MARAUDER_DEBUG_USB_BOOT
+static void bootProbePromiscRxCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  (void)type;
+  if (!buf) {
+    return;
+  }
+
+  boot_probe_promisc_frames++;
+}
+
+static void bootProbeCsiRxCb(void* ctx, wifi_csi_info_t* info) {
+  (void)ctx;
+  if (!info || !info->buf) {
+    return;
+  }
+
+  boot_probe_csi_frames++;
+}
+
+static void runBootPassiveProbe(bool verbose = false) {
+  auto bootProbePrintln = [verbose](const char* msg) {
+    if (verbose) {
+      Serial.println(msg);
+    }
+  };
+  auto bootProbePrintValue = [verbose](const char* msg, int value) {
+    if (verbose) {
+      Serial.print(msg);
+      Serial.println(value);
+    }
+  };
+
+  bootProbePrintln("BOOT_PROBE: begin");
+  boot_probe_csi_frames = 0;
+  boot_probe_promisc_frames = 0;
+
+  esp_wifi_set_csi(false);
+  esp_wifi_set_csi_rx_cb(nullptr, nullptr);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_err_t err = esp_wifi_init(&cfg);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_init=", (int)err);
+  if (err != ESP_OK) {
+    return;
+  }
+
+  err = esp_wifi_set_mode(WIFI_MODE_STA);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_mode=", (int)err);
+  if (err != ESP_OK) {
+    return;
+  }
+
+  err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_storage=", (int)err);
+
+  err = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_bandwidth=", (int)err);
+
+  err = esp_wifi_start();
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_start=", (int)err);
+  if (err != ESP_OK) {
+    return;
+  }
+
+  err = esp_wifi_set_ps(WIFI_PS_NONE);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_ps=", (int)err);
+
+  err = esp_wifi_set_channel(6, WIFI_SECOND_CHAN_BELOW);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_channel=", (int)err);
+
+  err = esp_wifi_set_promiscuous(true);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_promiscuous=", (int)err);
+
+  bootProbePrintln("BOOT_PROBE: esp_wifi_set_promiscuous_filter=SKIP");
+  bootProbePrintln("BOOT_PROBE: esp_wifi_set_promiscuous_rx_cb=SKIP");
+
+  wifi_csi_config_t csi_config = {
+      .lltf_en = true,
+      .htltf_en = true,
+      .stbc_htltf2_en = true,
+      .ltf_merge_en = true,
+      .channel_filter_en = true,
+      .manu_scale = false,
+      .shift = false,
+  };
+  err = esp_wifi_set_csi_config(&csi_config);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_csi_config=", (int)err);
+
+  err = esp_wifi_set_csi_rx_cb(bootProbeCsiRxCb, nullptr);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_csi_rx_cb=", (int)err);
+
+  err = esp_wifi_set_csi(true);
+  bootProbePrintValue("BOOT_PROBE: esp_wifi_set_csi=", (int)err);
+
+  uint32_t start_ms = millis();
+  uint32_t last_log_ms = start_ms;
+  while ((millis() - start_ms) < 5000) {
+    if (verbose && (millis() - last_log_ms) >= 1000) {
+      last_log_ms = millis();
+      Serial.print("BOOT_PROBE: csi_frames=");
+      Serial.print((unsigned long)boot_probe_csi_frames);
+      Serial.print(" promisc_frames=");
+      Serial.println((unsigned long)boot_probe_promisc_frames);
+    }
+    delay(10);
+  }
+
+  if (verbose) {
+    Serial.print("BOOT_PROBE: final csi_frames=");
+    Serial.print((unsigned long)boot_probe_csi_frames);
+    Serial.print(" promisc_frames=");
+    Serial.println((unsigned long)boot_probe_promisc_frames);
+  }
+
+  esp_wifi_set_csi(false);
+  esp_wifi_set_csi_rx_cb(nullptr, nullptr);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  bootProbePrintln("BOOT_PROBE: end");
+}
 #endif
 
 // Helper macros for LEDC API compatibility (2.x vs 3.x board package)
@@ -244,7 +372,7 @@ void setup()
     esp_log_level_set("*", ESP_LOG_NONE);
   #endif
   
-  #ifndef HAS_IDF_3
+  #if !defined(HAS_IDF_3) && defined(HAS_PSRAM)
     esp_spiram_init();
   #endif
 
@@ -255,6 +383,10 @@ void setup()
   while(!Serial && (millis() - serial_wait_start) < 2000)
     delay(10);
   BOOT_DEBUG_PRINTLN("BOOT: serial wait done");
+
+  #if defined(MARAUDER_FLIPPER) && defined(MARAUDER_DEBUG_USB_BOOT)
+    runBootPassiveProbe(true);
+  #endif
 
   #ifdef HAS_C5_SD
     sharedSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
@@ -368,6 +500,11 @@ void setup()
   buffer_obj = Buffer();
   BOOT_DEBUG_PRINTLN("BOOT: buffer init done");
 
+  #if defined(MARAUDER_FLIPPER) && defined(MARAUDER_DEBUG_USB_BOOT)
+    Serial.println("BOOT_PROBE: post-buffer");
+    runBootPassiveProbe(true);
+  #endif
+
   #ifndef HAS_SIMPLEX_DISPLAY
     #if defined(HAS_SD)
       // Do some SD stuff
@@ -379,6 +516,11 @@ void setup()
 
   wifi_scan_obj.RunSetup();
   BOOT_DEBUG_PRINTLN("BOOT: wifi scan setup done");
+
+  #if defined(MARAUDER_FLIPPER) && defined(MARAUDER_DEBUG_USB_BOOT)
+    Serial.println("BOOT_PROBE: post-wifi-scan-setup");
+    runBootPassiveProbe(true);
+  #endif
 
   #ifdef HAS_SCREEN
     display_obj.tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -409,7 +551,11 @@ void setup()
   #endif
 
   #ifdef HAS_GPS
-    gps_obj.begin();
+    #if defined(MARAUDER_DEBUG_USB_BOOT) && defined(MARAUDER_FLIPPER)
+      BOOT_DEBUG_PRINTLN("BOOT: gps begin skipped for usb debug");
+    #else
+      gps_obj.begin();
+    #endif
   #endif
   BOOT_DEBUG_PRINTLN("BOOT: gps begin done");
 
@@ -436,6 +582,11 @@ void setup()
 
   wifi_scan_obj.StartScan(WIFI_SCAN_OFF);
   BOOT_DEBUG_PRINTLN("BOOT: wifi scan off");
+
+  #if defined(MARAUDER_FLIPPER) && defined(MARAUDER_DEBUG_USB_BOOT)
+    Serial.println("BOOT_PROBE: pre-cli");
+    runBootPassiveProbe(true);
+  #endif
   
   cli_obj.RunSetup();
   BOOT_DEBUG_PRINTLN("BOOT: cli setup done");

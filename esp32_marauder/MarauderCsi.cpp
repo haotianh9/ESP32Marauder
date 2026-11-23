@@ -5,6 +5,17 @@
 
 #include "esp_mac.h"
 
+static MarauderCsi* g_active_marauder_csi = nullptr;
+
+static void marauderCsiRxShim(void* ctx, wifi_csi_info_t* info) {
+  MarauderCsi* self = ctx ? (MarauderCsi*)ctx : g_active_marauder_csi;
+  if (!self) {
+    return;
+  }
+
+  self->handleRxShim(info);
+}
+
 MarauderCsi::MarauderCsi() {
 }
 
@@ -30,6 +41,9 @@ esp_err_t MarauderCsi::start(
 
   this->resetCounters();
   this->clearQueue();
+  this->last_emit_ms_ = 0;
+  this->debug_frames_logged_ = 0;
+  g_active_marauder_csi = this;
 
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C61)
   wifi_csi_config_t csi_config = {
@@ -69,7 +83,7 @@ esp_err_t MarauderCsi::start(
       .htltf_en          = true,
       .stbc_htltf2_en    = true,
       .ltf_merge_en      = true,
-      .channel_filter_en = false,
+      .channel_filter_en = true,
       .manu_scale        = false,
       .shift             = false,
   };
@@ -86,12 +100,15 @@ esp_err_t MarauderCsi::start(
     return status;
   }
 
-  status = esp_wifi_set_csi_rx_cb(&MarauderCsi::wifiCsiRxCallback, this);
+  status = esp_wifi_set_csi_rx_cb(&marauderCsiRxShim, nullptr);
   if (status != ESP_OK) {
 #ifdef MARAUDER_DEBUG_USB_BOOT
     Serial.print(F("CSI_DEBUG rx_cb err: "));
     Serial.println((int)status);
 #endif
+    if (g_active_marauder_csi == this) {
+      g_active_marauder_csi = nullptr;
+    }
     this->source_ = MARAUDER_CSI_SOURCE_NONE;
     this->filter_mac_ = false;
     return status;
@@ -106,6 +123,9 @@ esp_err_t MarauderCsi::start(
     Serial.print(F("CSI_DEBUG enable err: "));
     Serial.println((int)status);
 #endif
+    if (g_active_marauder_csi == this) {
+      g_active_marauder_csi = nullptr;
+    }
     this->source_ = MARAUDER_CSI_SOURCE_NONE;
     this->filter_mac_ = false;
   }
@@ -114,12 +134,13 @@ esp_err_t MarauderCsi::start(
 }
 
 void MarauderCsi::stop() {
-  if (!this->active_) {
-    return;
+  if (this->active_) {
+    esp_wifi_set_csi(false);
+    esp_wifi_set_csi_rx_cb(nullptr, nullptr);
   }
-
-  esp_wifi_set_csi(false);
-  esp_wifi_set_csi_rx_cb(nullptr, nullptr);
+  if (g_active_marauder_csi == this) {
+    g_active_marauder_csi = nullptr;
+  }
 
   this->active_ = false;
   this->source_ = MARAUDER_CSI_SOURCE_NONE;
@@ -221,26 +242,50 @@ const char* MarauderCsi::formatName(MarauderCsiFormat format) {
 
 void MarauderCsi::wifiCsiRxCallback(void* ctx, wifi_csi_info_t* info) {
   MarauderCsi* self = (MarauderCsi*)ctx;
-  if (!self || !self->active_ || !info || !info->buf) {
+  if (!self) {
     return;
   }
 
-  if (self->filter_mac_ && memcmp(info->mac, self->filter_bssid_, sizeof(self->filter_bssid_)) != 0) {
+  self->handleRx(info);
+}
+
+void MarauderCsi::handleRxShim(const wifi_csi_info_t* info) {
+  this->handleRx(info);
+}
+
+void MarauderCsi::handleRx(const wifi_csi_info_t* info) {
+  if (!this->active_ || !info || !info->buf) {
     return;
   }
 
-  uint32_t sample_index = ++self->frames_seen_;
-  if ((self->sample_divisor_ > 1) && (((sample_index - 1) % self->sample_divisor_) != 0)) {
-    self->frames_dropped_++;
+  uint32_t sample_index = ++this->frames_seen_;
+
+  if (this->filter_mac_ && memcmp(info->mac, this->filter_bssid_, sizeof(this->filter_bssid_)) != 0) {
+    return;
+  }
+
+#ifdef MARAUDER_DEBUG_USB_BOOT
+  if (this->debug_frames_logged_ < 8) {
+    this->debug_frames_logged_++;
+    Serial.printf(
+        "CSI_DEBUG_RX LEN:%d RSSI:%d CH:%d SRC:%s\r\n",
+        info->len,
+        info->rx_ctrl.rssi,
+        info->rx_ctrl.channel,
+        MarauderCsi::sourceName(this->source_));
+  }
+#endif
+  if ((this->sample_divisor_ > 1) && (((sample_index - 1) % this->sample_divisor_) != 0)) {
+    this->frames_dropped_++;
     return;
   }
 
   if (info->rx_ctrl.channel > 0) {
-    self->channel_ = info->rx_ctrl.channel;
+    this->channel_ = info->rx_ctrl.channel;
   }
 
-  if (!self->enqueueFrame(info, sample_index)) {
-    self->frames_dropped_++;
+  if (!this->enqueueFrame(info, sample_index)) {
+    this->frames_dropped_++;
   }
 }
 
@@ -303,7 +348,13 @@ bool MarauderCsi::enqueueFrame(const wifi_csi_info_t* info, uint32_t sample_inde
   frame.amp_std_x100 = (int32_t)lroundf(sqrtf(variance) * 100.0f);
 
   if (frame.format == MARAUDER_CSI_FORMAT_RAW) {
-    frame.stored_len = frame.len > kMaxPayloadLen ? kMaxPayloadLen : frame.len;
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+    uint16_t max_payload_len =
+        frame.source == MARAUDER_CSI_SOURCE_ROUTER ? 64 : 160;
+#else
+    uint16_t max_payload_len = kMaxPayloadLen;
+#endif
+    frame.stored_len = frame.len > max_payload_len ? max_payload_len : frame.len;
     frame.truncated = frame.stored_len != frame.len;
     memcpy(frame.payload, info->buf, frame.stored_len);
   }
@@ -326,16 +377,25 @@ void MarauderCsi::service() {
     return;
   }
 
+  uint32_t emit_interval_ms = this->format_ == MARAUDER_CSI_FORMAT_RAW ? 250 : 100;
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+  if (this->format_ == MARAUDER_CSI_FORMAT_RAW) {
+    emit_interval_ms = 500;
+  }
+#endif
+  uint32_t now = millis();
+  if ((this->last_emit_ms_ > 0) && ((now - this->last_emit_ms_) < emit_interval_ms)) {
+    return;
+  }
+
   uint8_t processed = 0;
-  while (processed < 2) {
+  while (processed < 1) {
     PendingFrame frame = {};
     bool have_frame = false;
 
     portENTER_CRITICAL(&this->queue_mux_);
     if (this->queue_count_ > 0) {
       frame = this->queue_[this->queue_tail_];
-      this->queue_tail_ = (this->queue_tail_ + 1) % kQueueDepth;
-      this->queue_count_--;
       have_frame = true;
     }
     portEXIT_CRITICAL(&this->queue_mux_);
@@ -344,12 +404,42 @@ void MarauderCsi::service() {
       break;
     }
 
+    // Native USB CDC on the ESP32-S2 often reports a small writable window
+    // even when short staged writes succeed. Keep a light backpressure guard,
+    // but do not require a full-line buffer before emitting.
+    size_t min_write = 16;
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+    if (frame.format == MARAUDER_CSI_FORMAT_RAW) {
+      min_write = 16;
+    }
+#endif
+    if (Serial.availableForWrite() < min_write) {
+      return;
+    }
+
+    portENTER_CRITICAL(&this->queue_mux_);
+    if (this->queue_count_ > 0) {
+      frame = this->queue_[this->queue_tail_];
+      this->queue_tail_ = (this->queue_tail_ + 1) % kQueueDepth;
+      this->queue_count_--;
+      have_frame = true;
+    }
+    else {
+      have_frame = false;
+    }
+    portEXIT_CRITICAL(&this->queue_mux_);
+
+    if (!have_frame) {
+      return;
+    }
+
     if (frame.format == MARAUDER_CSI_FORMAT_RAW) {
       this->emitRaw(frame);
     }
     else {
       this->emitSummary(frame);
     }
+    this->last_emit_ms_ = millis();
     this->frames_emitted_++;
     processed++;
   }
@@ -370,58 +460,102 @@ void MarauderCsi::emitSummary(const PendingFrame& frame) {
 }
 
 void MarauderCsi::emitRaw(const PendingFrame& frame) {
+  // Stage the whole raw line first so USB CDC sees one bounded write instead
+  // of dozens of tiny prints.
+  String line;
+  line.reserve(frame.stored_len * 5 + 256);
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32C61)
-  Serial.printf(
-      "CSI_DATA,%lu," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
-      (unsigned long)frame.sample_index,
-      MAC2STR(frame.mac),
-      frame.rssi,
-      frame.rate,
-      frame.noise_floor,
-      0,
-      0,
-      frame.channel,
-      frame.timestamp,
-      frame.sig_len,
-      0);
+  line += "CSI_DATA,";
+  line += String((unsigned long)frame.sample_index);
+  line += ",";
+  char mac_buf[18];
+  snprintf(
+      mac_buf,
+      sizeof(mac_buf),
+      MACSTR,
+      MAC2STR(frame.mac));
+  line += mac_buf;
+  line += ",";
+  line += String(frame.rssi);
+  line += ",";
+  line += String(frame.rate);
+  line += ",";
+  line += String(frame.noise_floor);
+  line += ",0,0,";
+  line += String(frame.channel);
+  line += ",";
+  line += String(frame.timestamp);
+  line += ",";
+  line += String(frame.sig_len);
+  line += ",0";
 #else
-  Serial.printf(
-      "CSI_DATA,%lu," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-      (unsigned long)frame.sample_index,
-      MAC2STR(frame.mac),
-      frame.rssi,
-      frame.rate,
-      frame.sig_mode,
-      frame.mcs,
-      frame.cwb,
-      frame.smoothing,
-      frame.not_sounding,
-      frame.aggregation,
-      frame.stbc,
-      frame.fec_coding,
-      frame.sgi,
-      frame.noise_floor,
-      frame.ampdu_cnt,
-      frame.channel,
-      frame.secondary_channel,
-      frame.timestamp,
-      frame.ant,
-      frame.sig_len,
-      frame.sig_mode);
+  line += "CSI_DATA,";
+  line += String((unsigned long)frame.sample_index);
+  line += ",";
+  char mac_buf[18];
+  snprintf(
+      mac_buf,
+      sizeof(mac_buf),
+      MACSTR,
+      MAC2STR(frame.mac));
+  line += mac_buf;
+  line += ",";
+  line += String(frame.rssi);
+  line += ",";
+  line += String(frame.rate);
+  line += ",";
+  line += String(frame.sig_mode);
+  line += ",";
+  line += String(frame.mcs);
+  line += ",";
+  line += String(frame.cwb);
+  line += ",";
+  line += String(frame.smoothing);
+  line += ",";
+  line += String(frame.not_sounding);
+  line += ",";
+  line += String(frame.aggregation);
+  line += ",";
+  line += String(frame.stbc);
+  line += ",";
+  line += String(frame.fec_coding);
+  line += ",";
+  line += String(frame.sgi);
+  line += ",";
+  line += String(frame.noise_floor);
+  line += ",";
+  line += String(frame.ampdu_cnt);
+  line += ",";
+  line += String(frame.channel);
+  line += ",";
+  line += String(frame.secondary_channel);
+  line += ",";
+  line += String(frame.timestamp);
+  line += ",";
+  line += String(frame.ant);
+  line += ",";
+  line += String(frame.sig_len);
+  line += ",";
+  line += String(frame.sig_mode);
 #endif
 
-  Serial.printf(",%d,%d,\"[", frame.len, frame.first_word_invalid ? 1 : 0);
+  line += ",";
+  line += String(frame.len);
+  line += ",";
+  line += String(frame.first_word_invalid ? 1 : 0);
+  line += ",\"[";
   for (uint16_t i = 0; i < frame.stored_len; i++) {
     if (i > 0) {
-      Serial.print(',');
+      line += ",";
     }
-    Serial.print((int)frame.payload[i]);
+    line += String((int)frame.payload[i]);
   }
   if (frame.truncated) {
     if (frame.stored_len > 0) {
-      Serial.print(',');
+      line += ",";
     }
-    Serial.print("TRUNC");
+    line += "TRUNC";
   }
-  Serial.print("]\"\r\n");
+  line += "]\"";
+  Serial.println(line);
 }
